@@ -109,7 +109,7 @@ ed_dashboard/
 
 ---
 ## NOTE
-Make sure you run the collab notebook, upload data rom there to the Dashboard!
+Make sure you run the collab notebook, upload data from there to the Dashboard!
 
 
 ---
