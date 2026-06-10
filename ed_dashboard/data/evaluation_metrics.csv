@@ -1,4 +1,0 @@
-Strategy,Average_Wait_Time,Resource_Utilization,Critical_Response_Time,Fairness_Index,Total_Reward,Allocated_Patients,Delayed_or_Transferred
-RL Only,47.23,0.812,23.554,0.52,17872.8,760,240
-Optimization Only,40.483,0.812,20.189,0.52,19091.4,760,240
-RL + Optimization,42.17,0.812,21.03,0.52,20310.0,760,240
