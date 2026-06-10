@@ -108,7 +108,7 @@ ed_dashboard/
 - **SciPy** — statistical functions
 
 ---
-##NOTE
+## NOTE
 Make sure you run the collab notebook, upload data rom there to the Dashboard!
 
 
