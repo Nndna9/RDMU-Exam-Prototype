@@ -108,7 +108,11 @@ ed_dashboard/
 - **SciPy** — statistical functions
 
 ---
+##NOTE
+Make sure you run the collab notebook, upload data rom there to the Dashboard!
 
+
+---
 ## 📜 License
 
 For academic use. Built as part of an RDMU course project.
