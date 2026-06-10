@@ -1,9 +1,17 @@
 """
 🏥 Smart Emergency Department Resource Allocation System
 =========================================================
-Streamlit Dashboard — 8 Pages
+Streamlit Dashboard — 9 Pages
 Decision-support system integrating RL, MDP, Fuzzy Logic, MCDM,
 Utility Theory, and Optimization for hospital ED resource management.
+
+Notebook algorithms integrated:
+  - Phase 3  → Probability model (Poisson arrivals, Normal treatment) in Overview
+  - Phase 5  → AHP pairwise matrix computed live (not hardcoded)
+  - Phase 7  → Real Q-Learning diagnostics and policy heatmap
+  - Phase 8  → Real ε-greedy exploration comparison loaded from CSV
+  - Phase 9  → Utility Theory page (NEW — Page 7)
+  - Phase 10 → PuLP optimization results loaded from CSV
 """
 
 import streamlit as st
@@ -13,6 +21,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
+from sklearn.preprocessing import MinMaxScaler
+import ast
 import os
 
 # ============================================================================
@@ -24,6 +34,10 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Suppress PuLP solver noise
+import logging
+logging.getLogger('pulp').setLevel(logging.WARNING)
 
 # ============================================================================
 # COLOR PALETTE — designed for accessible contrast
@@ -259,6 +273,22 @@ st.markdown("""
     #MainMenu { visibility: hidden; }
     footer    { visibility: hidden; }
     header    { visibility: hidden; }
+
+    /* Force Plotly/SVG chart text to black on white chart backgrounds */
+    .js-plotly-plot .plotly text,
+    .js-plotly-plot .xtick text,
+    .js-plotly-plot .ytick text,
+    .js-plotly-plot .legendtext,
+    .js-plotly-plot .gtitle,
+    .js-plotly-plot .annotation-text,
+    svg text {
+        fill: #000000 !important;
+        color: #000000 !important;
+    }
+
+    .js-plotly-plot .hovertext text {
+        fill: #000000 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -267,32 +297,82 @@ st.markdown("""
 # HELPERS
 # ============================================================================
 def style_plotly(fig, title=None, height=None):
-    """Apply consistent dark-text-on-white styling to all Plotly charts."""
+    """Apply consistent black-text-on-white styling to all Plotly charts.
+
+    This also removes common Plotly "undefined" hover/label artifacts caused by
+    empty trace names or null text fields.
+    """
     fig.update_layout(
-        title=dict(text=title, font=dict(color=COLORS['primary'], size=16)) if title else None,
+        title=dict(text=title, font=dict(color="#000000", size=16)) if title else None,
         plot_bgcolor='white',
         paper_bgcolor='white',
-        font=dict(color=COLORS['text_dark'], family='Arial, sans-serif', size=12),
+        font=dict(color="#000000", family='Arial, sans-serif', size=12),
+        hoverlabel=dict(bgcolor="white", font_color="black", bordercolor=COLORS['border']),
         xaxis=dict(
             gridcolor=COLORS['border'],
             linecolor='#bdc3c7',
-            tickfont=dict(color=COLORS['text_dark']),
-            title_font=dict(color=COLORS['text_dark']),
+            tickfont=dict(color="#000000"),
+            title_font=dict(color="#000000"),
         ),
         yaxis=dict(
             gridcolor=COLORS['border'],
             linecolor='#bdc3c7',
-            tickfont=dict(color=COLORS['text_dark']),
-            title_font=dict(color=COLORS['text_dark']),
+            tickfont=dict(color="#000000"),
+            title_font=dict(color="#000000"),
         ),
         legend=dict(
-            font=dict(color=COLORS['text_dark']),
-            bgcolor='rgba(255,255,255,0.8)',
+            font=dict(color="#000000"),
+            bgcolor='rgba(255,255,255,0.9)',
             bordercolor=COLORS['border'],
             borderwidth=1,
         ),
         margin=dict(l=40, r=40, t=60 if title else 30, b=40),
     )
+    fig.update_xaxes(tickfont=dict(color="#000000"), title_font=dict(color="#000000"))
+    fig.update_yaxes(tickfont=dict(color="#000000"), title_font=dict(color="#000000"))
+
+    # Clean trace-level labels and hover output. Never allow visible "undefined".
+    bad_tokens = {None, "undefined", "Undefined", "UNDEFINED", "nan", "NaN", "None"}
+
+    def _clean_value(v):
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        txt = str(v)
+        if txt.strip() in bad_tokens or txt.strip().lower() == "undefined":
+            return ""
+        return txt.replace("undefined", "").replace("Undefined", "").replace("UNDEFINED", "")
+
+    for trace in fig.data:
+        if getattr(trace, "name", None) in bad_tokens or str(getattr(trace, "name", "")).lower() == "undefined":
+            trace.name = ""
+            trace.showlegend = False if getattr(trace, "showlegend", None) is None else trace.showlegend
+        if hasattr(trace, "text") and trace.text is not None:
+            try:
+                trace.text = [_clean_value(x) for x in trace.text]
+            except TypeError:
+                trace.text = _clean_value(trace.text)
+        if hasattr(trace, "customdata") and trace.customdata is not None:
+            try:
+                trace.customdata = [[_clean_value(x) for x in row] if isinstance(row, (list, tuple, np.ndarray)) else _clean_value(row) for row in trace.customdata]
+            except Exception:
+                pass
+        if hasattr(trace, "textfont"):
+            trace.textfont = dict(color="#000000", size=getattr(getattr(trace, "textfont", None), "size", 12) or 12)
+        if getattr(trace, "hovertemplate", None):
+            trace.hovertemplate = _clean_value(trace.hovertemplate)
+        elif getattr(trace, "hoverinfo", None) is None:
+            # Keeps Plotly from appending trace names such as undefined in hover boxes.
+            trace.hovertemplate = None
+
+    # Clean annotation text, including vline annotations and subplot titles.
+    if getattr(fig.layout, "annotations", None):
+        for ann in fig.layout.annotations:
+            ann.text = _clean_value(getattr(ann, "text", ""))
+            ann.font = dict(color="#000000", size=getattr(getattr(ann, "font", None), "size", 12) or 12)
+
     if height:
         fig.update_layout(height=height)
     return fig
@@ -353,6 +433,27 @@ def strategy_card(strategy_name, color, badge, wait, response, util, fairness, a
 # ============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def data_file_path(name):
+    """Find a CSV/output file across common Streamlit deployment layouts."""
+    candidates = [
+        os.path.join(SCRIPT_DIR, 'data'),
+        SCRIPT_DIR,
+        os.path.join(os.getcwd(), 'ed_dashboard', 'data'),
+        os.path.join(os.getcwd(), 'data'),
+        os.getcwd(),
+    ]
+    for base in candidates:
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+def load_optional_csv(name):
+    path = data_file_path(name)
+    if path is None:
+        return None
+    return pd.read_csv(path)
+
 @st.cache_data
 def load_data():
     # Try several locations so the app works whether Streamlit runs from
@@ -378,6 +479,13 @@ def load_data():
     rankings = _read('patient_rankings.csv')
     alloc    = _read('allocation_results.csv')
     eval_df  = _read('evaluation_metrics.csv')
+
+    # Remove literal undefined/null strings before they reach Plotly labels or hover boxes.
+    for _df in [hospital, fuzzy, rankings, alloc, eval_df]:
+        _df.replace({
+            'undefined': '', 'Undefined': '', 'UNDEFINED': '',
+            'nan': '', 'NaN': '', 'None': '', None: ''
+        }, inplace=True)
 
     hospital['Arrival_Time'] = pd.to_datetime(hospital['Arrival_Time'])
     rankings['Arrival_Time'] = pd.to_datetime(rankings['Arrival_Time'])
@@ -413,9 +521,10 @@ with st.sidebar:
         "🔥  3. Fuzzy Triage",
         "🎯  4. MCDM Analysis",
         "🤖  5. RL Analytics",
-        "⚙️  6. Optimization",
-        "🎚️  7. Trade-Off Studio",
-        "📈  8. Executive Dashboard",
+        "💡  6. Utility Theory",
+        "⚙️  7. Optimization",
+        "🎚️  8. Trade-Off Studio",
+        "📈  9. Executive Dashboard",
     ]
     page = st.radio("Navigation", pages, label_visibility="collapsed")
 
@@ -488,7 +597,8 @@ with st.sidebar:
     st.markdown("##### ℹ️ About")
     st.markdown(
         "Decision-support system integrating "
-        "**RL · MDP · Fuzzy · MCDM · Utility · Optimization**."
+        "**RL · MDP · Fuzzy · MCDM · Utility · Optimization**.\n\n"
+        "Notebook algorithms (Phases 3–10) fully integrated."
     )
 
 
@@ -544,6 +654,47 @@ def page_overview():
 
     st.markdown("###  ")
 
+    # ── Phase 3: Probability Model Stats ──────────────────────────────────────
+    with st.expander("📐 Probability Model — Poisson Arrivals & Normal Treatment Times", expanded=False):
+        arrival_minutes = df['Arrival_Minute'].values if 'Arrival_Minute' in df.columns else None
+        if arrival_minutes is not None and len(arrival_minutes) > 1:
+            inter_arrivals = np.diff(np.sort(arrival_minutes))
+            lam = 1 / max(inter_arrivals.mean(), 1e-9)
+            expected_per_hr = lam * 60
+        else:
+            lam, expected_per_hr = 0.0, 0.0
+
+        treat_mean = df['Treatment_Time'].mean() if 'Treatment_Time' in df.columns else 0.0
+        treat_std  = df['Treatment_Time'].std()  if 'Treatment_Time' in df.columns else 0.0
+
+        pm1, pm2, pm3, pm4 = st.columns(4)
+        pm1.metric("Poisson λ (arr/min)", f"{lam:.4f}")
+        pm2.metric("Expected Arrivals/hr", f"{expected_per_hr:.1f}")
+        pm3.metric("Treatment Time μ",    f"{treat_mean:.1f} min")
+        pm4.metric("Treatment Time σ",    f"{treat_std:.1f} min")
+
+        # Demand forecast loaded from CSV (Phase 3 output)
+        demand_df = load_optional_csv('demand_forecast.csv')
+        if demand_df is not None and not demand_df.empty:
+            st.markdown("**Hourly Demand Forecast** (from `demand_forecast.csv`):")
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=demand_df['Hour'], y=demand_df['Patient_Count'],
+                name='Actual Count',
+                marker=dict(color=COLORS['secondary'], opacity=0.8),
+            ))
+            if 'Expected' in demand_df.columns:
+                fig.add_hline(
+                    y=demand_df['Expected'].iloc[0],
+                    line_dash="dash", line_color=COLORS['accent'],
+                    annotation_text=f"Expected/hr = {demand_df['Expected'].iloc[0]:.1f}",
+                    annotation_font_color=COLORS['accent'],
+                )
+            fig.update_layout(xaxis_title="Hour of Day", yaxis_title="Patient Count")
+            st.plotly_chart(style_plotly(fig, height=280), use_container_width=True)
+        else:
+            st.caption("Run notebook Phase 3 to generate `demand_forecast.csv` for the full forecast chart.")
+
     # Row: Hourly arrivals + severity pie
     col_l, col_r = st.columns([3, 2])
 
@@ -574,7 +725,7 @@ def page_overview():
                         line=dict(color='white', width=2)),
             hole=0.5,
             textinfo='label+percent',
-            textfont=dict(color='white', size=12),
+            textfont=dict(color='#000000', size=12),
         )])
         fig.update_layout(showlegend=True, height=350,
                           legend=dict(orientation="v", yanchor="middle", y=0.5, x=1.1))
@@ -866,6 +1017,23 @@ def page_mcdm():
     page_header("🎯 Multi-Criteria Decision Making",
                 "AHP weight elicitation and TOPSIS patient ranking")
 
+    # ── AHP Computation (from Phase 5 of notebook) ────────────────────────────
+    ahp_criteria = ['Urgency', 'Waiting Time', 'Resource Cost', 'Fairness']
+    pairwise = np.array([
+        [1,    2,    4,    4  ],
+        [1/2,  1,    3,    3  ],
+        [1/4,  1/3,  1,    1  ],
+        [1/4,  1/3,  1,    1  ],
+    ])
+    col_sums       = pairwise.sum(axis=0)
+    norm_matrix    = pairwise / col_sums
+    ahp_weights    = norm_matrix.mean(axis=1)
+    lambda_max     = (pairwise @ ahp_weights / ahp_weights).mean()
+    n              = len(ahp_criteria)
+    CI             = (lambda_max - n) / (n - 1)
+    RI             = {1:0, 2:0, 3:0.58, 4:0.90, 5:1.12}[n]
+    CR             = CI / RI
+
     # KPIs
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Patients Ranked",  f"{len(patient_rankings):,}")
@@ -879,8 +1047,8 @@ def page_mcdm():
     with col_l:
         st.markdown("#### ⚖️ AHP Criteria Weights")
         ahp_data = pd.DataFrame({
-            'Criterion': ['Urgency', 'Waiting Time', 'Resource Cost', 'Fairness'],
-            'Weight':    [0.40, 0.30, 0.15, 0.15],
+            'Criterion': ahp_criteria,
+            'Weight':    ahp_weights.round(4),
         })
         fig = go.Figure(data=[go.Pie(
             labels=ahp_data['Criterion'], values=ahp_data['Weight'],
@@ -888,7 +1056,7 @@ def page_mcdm():
                                 COLORS['success'], COLORS['warning']],
                         line=dict(color='white', width=2)),
             hole=0.55, textinfo='label+percent',
-            textfont=dict(color='white', size=12),
+            textfont=dict(color='#000000', size=12),
         )])
         fig.update_layout(height=400, showlegend=False,
                           annotations=[dict(text='AHP<br>Weights', x=0.5, y=0.5,
@@ -896,9 +1064,13 @@ def page_mcdm():
                                             showarrow=False)])
         st.plotly_chart(style_plotly(fig), use_container_width=True)
 
+        cr_status = "✅ Consistent (CR < 0.10)" if CR < 0.10 else "⚠️ Inconsistent"
         with st.container(border=True):
-            st.markdown("**Consistency Ratio (CR):** `0.0124` ✅ Consistent")
-            st.markdown("**λ_max:** `4.033` | **CI:** `0.011` | **RI:** `0.90`")
+            st.markdown(f"**Consistency Ratio (CR):** `{CR:.4f}` {cr_status}")
+            st.markdown(f"**λ_max:** `{lambda_max:.4f}` | **CI:** `{CI:.4f}` | **RI:** `{RI}`")
+            st.markdown("**Pairwise Matrix (derived from notebook Phase 5):**")
+            pm_df = pd.DataFrame(pairwise, index=ahp_criteria, columns=ahp_criteria)
+            st.dataframe(pm_df.round(3), use_container_width=True)
 
     with col_r:
         st.markdown("#### 🏆 Top 20 Patients by TOPSIS Score")
@@ -919,6 +1091,26 @@ def page_mcdm():
                           xaxis_range=[0.65, 0.82], showlegend=False)
         st.plotly_chart(style_plotly(fig, height=600), use_container_width=True)
 
+    # TOPSIS re-validation tab
+    st.markdown("#### 🔁 TOPSIS Re-Validation (Phase 5 Notebook)")
+    topsis_input = patient_rankings[['Urgency_Score','Waiting_Time','Resource_Cost','Fairness_Score']].copy()
+    scaler = MinMaxScaler()
+    norm = scaler.fit_transform(topsis_input)
+    norm[:, 2] = 1 - norm[:, 2]   # lower cost is better
+    weighted = norm * ahp_weights
+    ideal_pos = weighted.max(axis=0)
+    ideal_neg = weighted.min(axis=0)
+    d_pos = np.sqrt(((weighted - ideal_pos) ** 2).sum(axis=1))
+    d_neg = np.sqrt(((weighted - ideal_neg) ** 2).sum(axis=1))
+    recomputed_score = d_neg / (d_pos + d_neg)
+    corr = np.corrcoef(recomputed_score, patient_rankings['TOPSIS_Score'])[0, 1]
+
+    with st.container(border=True):
+        st.markdown(f"**Re-computation correlation with source CSV:** `{corr:.4f}` "
+                    f"{'✅ Strong agreement' if corr > 0.95 else '⚠️ Check data alignment'}")
+        st.caption("TOPSIS scores are re-derived here using the same AHP weights above. "
+                   "High correlation confirms the CSV was generated with the same methodology.")
+
     # Full ranking table
     st.markdown("#### 📋 Patient Priority Table")
     f1, f2, f3 = st.columns([2, 2, 2])
@@ -929,7 +1121,7 @@ def page_mcdm():
     with f2:
         rank_max = st.slider("Show Top N Patients", 10, 100, 25)
     with f3:
-        st.write("")  # spacing
+        st.write("")
         st.write("")
         st.markdown(f"**Showing:** Top {rank_max} ranked patients")
 
@@ -956,142 +1148,494 @@ def page_rl():
     page_header("🤖 Reinforcement Learning Analytics",
                 "Q-Learning training analysis, policy visualization, and exploration trade-offs")
 
-    # Simulated training data (deterministic)
-    np.random.seed(42)
-    episodes = np.arange(1, 1001)
-    rewards = (
-        500 + 1000 * (1 - np.exp(-episodes / 200))
-        + 200 * np.sin(episodes / 30)
-        + np.random.normal(0, 80, 1000)
-    )
-    rewards_smooth = pd.Series(rewards).rolling(50, min_periods=1).mean()
+    # Load real RL outputs produced by the Colab notebook when available.
+    diagnostics = load_optional_csv('rl_diagnostics.csv')
+    policy_summary = load_optional_csv('q_policy_summary.csv')
 
-    # KPIs
+    if diagnostics is None or policy_summary is None or policy_summary.empty:
+        st.warning(
+            "Real RL output files were not found. Add `rl_diagnostics.csv` and "
+            "`q_policy_summary.csv` to the same data folder as the other CSVs. "
+            "The dashboard will not display a random/fake policy heatmap."
+        )
+        st.info(
+            "Run the fixed Colab notebook first, then copy these files into `ed_dashboard/data/`: "
+            "`rl_diagnostics.csv`, `q_policy_summary.csv`, and optionally `Q_Table.pkl`."
+        )
+        return
+
+    diagnostics = diagnostics.copy()
+    policy_summary = policy_summary.copy()
+    diagnostics['Metric'] = diagnostics['Metric'].astype(str)
+    diagnostics['Value'] = pd.to_numeric(diagnostics['Value'], errors='coerce').fillna(0)
+
+    diag = dict(zip(diagnostics['Metric'], diagnostics['Value']))
+    episodes = int(diag.get('Episodes', 1000))
+    learned_states = int(diag.get('Learned_States', len(policy_summary)))
+    total_visits = int(diag.get('Total_State_Visits', policy_summary.get('Visits', pd.Series([0])).sum()))
+    exploration = int(diag.get('Exploration_Actions', 0))
+    exploitation = int(diag.get('Exploitation_Actions', max(total_visits - exploration, 0)))
+
+    # KPIs based on real diagnostics, not simulated curves.
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Episodes Trained",    "1,000")
-    c2.metric("Final Avg Reward",    f"{rewards_smooth.iloc[-1]:.0f}")
-    c3.metric("Learning Rate (α)",   "0.10")
-    c4.metric("Discount Factor (γ)", "0.95")
+    c1.metric("Episodes Trained", f"{episodes:,}")
+    c2.metric("Learned States", f"{learned_states:,}")
+    c3.metric("State Visits", f"{total_visits:,}")
+    explore_rate = exploration / max(exploration + exploitation, 1)
+    c4.metric("Exploration Rate", f"{explore_rate:.1%}")
 
-    # Reward + learning curves
+    # Diagnostics chart + action distribution.
     col_l, col_r = st.columns(2)
 
     with col_l:
-        st.markdown("#### 📈 Reward Curve")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=episodes, y=rewards,
-                                  mode='lines', name='Episode Reward',
-                                  line=dict(color=COLORS['secondary'], width=1),
-                                  opacity=0.4))
-        fig.add_trace(go.Scatter(x=episodes, y=rewards_smooth,
-                                  mode='lines', name='50-ep Moving Avg',
-                                  line=dict(color=COLORS['accent'], width=3)))
-        fig.update_layout(xaxis_title="Episode", yaxis_title="Total Reward")
-        st.plotly_chart(style_plotly(fig, height=350), use_container_width=True)
+        st.markdown("#### 📊 RL Diagnostics")
+        show_metrics = diagnostics[diagnostics['Metric'].isin([
+            'Episodes', 'Learned_States', 'Total_State_Visits',
+            'Exploration_Actions', 'Exploitation_Actions'
+        ])].copy()
+        show_metrics['Metric'] = show_metrics['Metric'].str.replace('_', ' ')
+        fig = go.Figure(go.Bar(
+            x=show_metrics['Metric'],
+            y=show_metrics['Value'],
+            text=[f"{v:,.0f}" for v in show_metrics['Value']],
+            textposition='outside',
+            textfont=dict(color='#000000', size=12),
+            marker=dict(color=COLORS['secondary'], line=dict(color='white', width=1)),
+        ))
+        fig.update_layout(xaxis_title="Metric", yaxis_title="Value", showlegend=False)
+        st.plotly_chart(style_plotly(fig, height=360), use_container_width=True)
 
     with col_r:
-        st.markdown("#### 📊 Learning Curve (Cumulative Mean)")
-        cum_mean = pd.Series(rewards).expanding().mean()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=episodes, y=cum_mean,
-                                  mode='lines',
-                                  line=dict(color=COLORS['success'], width=3),
-                                  fill='tozeroy',
-                                  fillcolor='rgba(39, 174, 96, 0.15)'))
-        fig.update_layout(xaxis_title="Episode", yaxis_title="Cumulative Mean Reward")
-        st.plotly_chart(style_plotly(fig, height=350), use_container_width=True)
+        st.markdown("#### 🎯 Learned Action Distribution")
+        action_counts = policy_summary['Best_Action'].fillna('Unknown').value_counts().reset_index()
+        action_counts.columns = ['Action', 'Count']
+        fig = go.Figure(go.Bar(
+            x=action_counts['Action'],
+            y=action_counts['Count'],
+            text=action_counts['Count'],
+            textposition='outside',
+            textfont=dict(color='#000000', size=12),
+            marker=dict(color=COLORS['success'], line=dict(color='white', width=1)),
+        ))
+        fig.update_layout(xaxis_title="Best learned action", yaxis_title="Number of visited states", showlegend=False)
+        st.plotly_chart(style_plotly(fig, height=360), use_container_width=True)
 
-    # Policy heatmap + epsilon comparison
-    col_l, col_r = st.columns(2)
+    # Policy heatmap from visited states only.
+    st.markdown("#### 🗺️ Policy Heatmap from Visited Q-Table States")
+    st.caption(
+        "This heatmap uses only states that appeared in `q_policy_summary.csv`. "
+        "It avoids the misleading old behaviour where unseen Q-table states defaulted to zero and `argmax()` selected the first action."
+    )
 
-    with col_l:
-        st.markdown("#### 🗺️ Policy Heatmap (Best Action)")
-        actions = ['Assign_Bed', 'Assign_Doctor', 'Assign_Nurse', 'Delay', 'Transfer']
-        np.random.seed(7)
-        policy = np.random.choice(5, size=(6, 6), p=[0.35, 0.25, 0.20, 0.10, 0.10])
-        # bias toward 'Assign_Bed' when beds available
-        for i in range(6):
-            for j in range(6):
-                if i > 2:
-                    policy[i, j] = np.random.choice([0, 1], p=[0.7, 0.3])
+    def parse_state(value):
+        try:
+            parsed = ast.literal_eval(str(value))
+            if isinstance(parsed, tuple) and len(parsed) >= 2:
+                return parsed
+        except Exception:
+            return None
+        return None
+
+    policy_summary['Parsed_State'] = policy_summary['State'].apply(parse_state)
+    policy_summary = policy_summary[policy_summary['Parsed_State'].notna()].copy()
+    policy_summary['Beds_Available'] = policy_summary['Parsed_State'].apply(lambda x: int(x[0]))
+    policy_summary['Doctors_Available'] = policy_summary['Parsed_State'].apply(lambda x: int(x[1]))
+    policy_summary['Visits'] = pd.to_numeric(policy_summary['Visits'], errors='coerce').fillna(0)
+    policy_summary['Best_Q_Value'] = pd.to_numeric(policy_summary['Best_Q_Value'], errors='coerce').fillna(0)
+
+    actions = sorted(policy_summary['Best_Action'].dropna().unique().tolist())
+    action_to_code = {a: i for i, a in enumerate(actions)}
+    policy_summary['Action_Code'] = policy_summary['Best_Action'].map(action_to_code)
+
+    min_visits = st.slider(
+        "Minimum visits required to show a state",
+        min_value=1,
+        max_value=max(1, int(policy_summary['Visits'].max())),
+        value=min(10, max(1, int(policy_summary['Visits'].max()))),
+        help="Higher values hide low-confidence states."
+    )
+    confident = policy_summary[policy_summary['Visits'] >= min_visits].copy()
+
+    if confident.empty:
+        st.warning("No states meet the selected visit threshold. Lower the slider.")
+    else:
+        # For duplicate bed/doctor pairs, keep the most visited learned state.
+        heat_df = (confident.sort_values('Visits', ascending=False)
+                   .drop_duplicates(['Beds_Available', 'Doctors_Available']))
+        beds = sorted(heat_df['Beds_Available'].unique())
+        docs = sorted(heat_df['Doctors_Available'].unique())
+        z = np.full((len(beds), len(docs)), np.nan)
+        text = np.full((len(beds), len(docs)), '', dtype=object)
+        hover = np.full((len(beds), len(docs)), '', dtype=object)
+
+        for _, row in heat_df.iterrows():
+            bi = beds.index(row['Beds_Available'])
+            di = docs.index(row['Doctors_Available'])
+            z[bi, di] = row['Action_Code']
+            text[bi, di] = str(row['Best_Action']).replace('Assign_', '')
+            hover[bi, di] = (
+                f"Beds: {row['Beds_Available']}<br>Doctors: {row['Doctors_Available']}"
+                f"<br>Best action: {row['Best_Action']}<br>Visits: {row['Visits']:,.0f}"
+                f"<br>Best Q-value: {row['Best_Q_Value']:,.2f}"
+            )
 
         fig = go.Figure(data=go.Heatmap(
-            z=policy,
-            x=[f'Doc={i}' for i in range(6)],
-            y=[f'Bed={i}' for i in range(6)],
-            colorscale=[[0, COLORS['secondary']], [0.25, COLORS['success']],
-                        [0.5, COLORS['warning']], [0.75, COLORS['info']],
-                        [1, COLORS['accent']]],
+            z=z,
+            x=[f'Doc={d}' for d in docs],
+            y=[f'Bed={b}' for b in beds],
+            colorscale='Viridis',
             colorbar=dict(
-                tickvals=[0, 1, 2, 3, 4],
-                ticktext=actions,
-                tickfont=dict(color=COLORS['text_dark'])
+                title=dict(text="Action", font=dict(color='#000000')),
+                tickvals=list(action_to_code.values()),
+                ticktext=list(action_to_code.keys()),
+                tickfont=dict(color='#000000')
             ),
-            text=policy, texttemplate="%{text}",
-            textfont=dict(color='white', size=10),
+            text=text,
+            texttemplate="%{text}",
+            textfont=dict(color='#000000', size=11),
+            customdata=hover,
+            hovertemplate='%{customdata}<extra></extra>',
+            zmin=0,
+            zmax=max(1, len(actions) - 1),
         ))
         fig.update_layout(xaxis_title="Doctors Available", yaxis_title="Beds Available")
-        st.plotly_chart(style_plotly(fig, height=400), use_container_width=True)
+        st.plotly_chart(style_plotly(fig, height=440), use_container_width=True)
 
-    with col_r:
-        st.markdown("#### 🎲 Exploration vs Exploitation (ε)")
-        eps_data = pd.DataFrame({
-            'Epsilon': ['ε = 0.1', 'ε = 0.2', 'ε = 0.3'],
-            'Final Reward': [1480, 1520, 1465],
-            'Convergence Episode': [320, 280, 420],
-        })
-        fig = go.Figure()
-        fig.add_trace(go.Bar(name='Final Reward',
-                              x=eps_data['Epsilon'], y=eps_data['Final Reward'],
-                              marker_color=COLORS['secondary'],
-                              text=eps_data['Final Reward'],
-                              textposition='outside',
-                              textfont=dict(color=COLORS['text_dark']),
-                              yaxis='y'))
-        fig.add_trace(go.Scatter(name='Convergence Episode',
-                                  x=eps_data['Epsilon'], y=eps_data['Convergence Episode'],
-                                  mode='lines+markers',
-                                  marker=dict(size=12, color=COLORS['accent']),
-                                  line=dict(width=3, color=COLORS['accent']),
-                                  yaxis='y2'))
-        fig.update_layout(
-            yaxis=dict(title="Final Reward", side='left',
-                       gridcolor=COLORS['border']),
-            yaxis2=dict(title="Convergence Episode", side='right',
-                        overlaying='y', showgrid=False),
-            legend=dict(x=0.01, y=0.99),
-        )
-        st.plotly_chart(style_plotly(fig, height=400), use_container_width=True)
+    # State visit confidence heatmap.
+    st.markdown("#### 🔎 State Visit Confidence")
+    if not policy_summary.empty:
+        visit_df = (policy_summary.groupby(['Beds_Available', 'Doctors_Available'])['Visits']
+                    .sum().reset_index())
+        beds = sorted(visit_df['Beds_Available'].unique())
+        docs = sorted(visit_df['Doctors_Available'].unique())
+        z = np.zeros((len(beds), len(docs)))
+        for _, row in visit_df.iterrows():
+            z[beds.index(row['Beds_Available']), docs.index(row['Doctors_Available'])] = row['Visits']
+        fig = go.Figure(data=go.Heatmap(
+            z=z,
+            x=[f'Doc={d}' for d in docs],
+            y=[f'Bed={b}' for b in beds],
+            colorscale='Blues',
+            colorbar=dict(title=dict(text="Visits", font=dict(color='#000000')), tickfont=dict(color='#000000')),
+            text=z.astype(int),
+            texttemplate="%{text}",
+            textfont=dict(color='#000000', size=11),
+            hovertemplate='Doctors: %{x}<br>Beds: %{y}<br>Visits: %{z}<extra></extra>',
+        ))
+        fig.update_layout(xaxis_title="Doctors Available", yaxis_title="Beds Available")
+        st.plotly_chart(style_plotly(fig, height=360), use_container_width=True)
 
-    # Episode performance details
+    # Training configuration.
     st.markdown("#### 📋 Training Configuration")
     config = pd.DataFrame({
         'Parameter': ['Algorithm', 'State Space', 'Action Space', 'Learning Rate (α)',
-                      'Discount (γ)', 'Exploration (ε)', 'Episodes', 'Reward Function'],
+                      'Discount (γ)', 'Exploration (ε)', 'Episodes', 'Policy Source'],
         'Value': ['Tabular Q-Learning',
-                  '(Beds, Docs, Nurses, Critical, Queue)',
-                  '5 actions: Assign_Bed, Assign_Doctor, Assign_Nurse, Delay, Transfer',
-                  '0.10', '0.95', '0.20 (ε-greedy)', '1,000',
-                  'Critical+100, Wait reduced+50, Waste-50, Critical delayed-100'],
+                  '(Beds, Doctors, Nurses, Ventilators, Critical, Queue, Severity/Urgency Bucket)',
+                  'Assign_Bed, Assign_Doctor, Assign_Nurse, Assign_Ventilator, Delay, Transfer',
+                  '0.10', '0.95', '0.20 ε-greedy', f'{episodes:,}',
+                  'Visited states from q_policy_summary.csv'],
     })
     st.dataframe(config, use_container_width=True, hide_index=True)
 
+    # ── Phase 8: Exploration vs Exploitation ─────────────────────────────────
+    st.markdown("#### 🎲 Exploration vs Exploitation — ε Comparison (Phase 8)")
+    exploration_df = load_optional_csv('exploration_results.csv')
+
+    if exploration_df is not None and not exploration_df.empty:
+        st.caption("Results loaded from `exploration_results.csv` produced by the Colab notebook.")
+        col_l, col_r = st.columns(2)
+
+        with col_l:
+            fig = go.Figure()
+            for _, row in exploration_df.iterrows():
+                fig.add_trace(go.Bar(
+                    name=f"ε = {row['Epsilon']}",
+                    x=[f"ε = {row['Epsilon']}"],
+                    y=[row['Final_Avg_Reward']],
+                    text=[f"{row['Final_Avg_Reward']:,.1f}"],
+                    textposition='outside',
+                    textfont=dict(color='#000000', size=12),
+                ))
+            fig.update_layout(
+                xaxis_title="Epsilon Value",
+                yaxis_title="Final Avg Reward (last 50 episodes)",
+                showlegend=False,
+                barmode='group',
+            )
+            st.plotly_chart(style_plotly(fig, height=340), use_container_width=True)
+
+        with col_r:
+            # Convergence episode & unique states side-by-side bar
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Bar(
+                x=[f"ε={r['Epsilon']}" for _, r in exploration_df.iterrows()],
+                y=exploration_df['Convergence_Episode'].tolist(),
+                name='Convergence Episode',
+                marker_color=COLORS['secondary'],
+                text=exploration_df['Convergence_Episode'].tolist(),
+                textposition='outside',
+                textfont=dict(color='#000000'),
+            ), secondary_y=False)
+            fig.add_trace(go.Scatter(
+                x=[f"ε={r['Epsilon']}" for _, r in exploration_df.iterrows()],
+                y=exploration_df['Unique_States_Visited'].tolist(),
+                name='Unique States Visited',
+                mode='lines+markers',
+                line=dict(color=COLORS['accent'], width=3),
+                marker=dict(size=10),
+            ), secondary_y=True)
+            fig.update_yaxes(title_text="Convergence Episode", secondary_y=False)
+            fig.update_yaxes(title_text="Unique States Visited", secondary_y=True)
+            fig.update_layout(legend=dict(x=0.01, y=0.99))
+            st.plotly_chart(style_plotly(fig, height=340), use_container_width=True)
+
+        # Summary table
+        st.dataframe(
+            exploration_df.rename(columns={
+                'Epsilon': 'ε', 'Final_Avg_Reward': 'Final Avg Reward',
+                'Convergence_Episode': 'Convergence Episode',
+                'Unique_States_Visited': 'Unique States Visited',
+            }),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.info(
+            "Exploration results not found. Run the Colab notebook (Phase 8) and copy "
+            "`exploration_results.csv` to the data folder to see the ε-comparison here."
+        )
+
 
 # ============================================================================
-# PAGE 6 — OPTIMIZATION ANALYSIS
+# PAGE 6 — UTILITY THEORY  (NEW — from Phase 9 of notebook)
+# ============================================================================
+def page_utility():
+    page_header("💡 Utility Theory Analysis",
+                "Multi-attribute utility function: Survival · Wait · Resource · Fairness")
+
+    # ── Utility weights (Phase 9 notebook) ───────────────────────────────────
+    W_SURVIVAL = 0.35
+    W_WAIT     = 0.25
+    W_UTIL     = 0.25
+    W_FAIRNESS = 0.15
+
+    def compute_utility(survival_prob, wait_time, resource_util, fairness_score, max_wait=120):
+        """Linear additive utility — all inputs normalised to [0, 1]."""
+        u_survival = float(survival_prob)
+        u_wait     = 1 - min(float(wait_time) / max_wait, 1)
+        u_util     = float(resource_util)
+        u_fairness = float(fairness_score) / 100.0 if float(fairness_score) > 1 else float(fairness_score)
+        return (W_SURVIVAL * u_survival + W_WAIT * u_wait +
+                W_UTIL * u_util + W_FAIRNESS * u_fairness)
+
+    # Build utility dataframe by merging allocation_results with fuzzy + rankings
+    util_df = allocation_results.merge(
+        fuzzy_scores[['Patient_ID', 'Survival_Probability']], on='Patient_ID', how='left')
+    util_df = util_df.merge(
+        patient_rankings[['Patient_ID', 'Fairness_Score']], on='Patient_ID', how='left')
+
+    util_df['Survival_Probability'] = pd.to_numeric(util_df['Survival_Probability'], errors='coerce').fillna(0.7)
+    util_df['Fairness_Score']        = pd.to_numeric(util_df['Fairness_Score'],        errors='coerce').fillna(50)
+    util_df['Post_Allocation_Wait']  = pd.to_numeric(util_df['Post_Allocation_Wait'],  errors='coerce').fillna(30)
+    util_df['Utility_Score']         = pd.to_numeric(util_df['Utility_Score'],         errors='coerce').fillna(50)
+
+    util_df['Computed_Utility'] = util_df.apply(
+        lambda r: compute_utility(
+            r['Survival_Probability'],
+            r['Post_Allocation_Wait'],
+            r['Utility_Score'] / 100.0,
+            r['Fairness_Score'],
+        ), axis=1
+    )
+
+    # KPIs
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Mean Utility",   f"{util_df['Computed_Utility'].mean():.4f}")
+    c2.metric("Max Utility",    f"{util_df['Computed_Utility'].max():.4f}")
+    c3.metric("Min Utility",    f"{util_df['Computed_Utility'].min():.4f}")
+    c4.metric("High Utility (>0.80)",
+              int((util_df['Computed_Utility'] > 0.80).sum()))
+
+    # Weight breakdown
+    st.markdown("#### ⚖️ Utility Weight Decomposition")
+    with st.container(border=True):
+        w1, w2, w3, w4 = st.columns(4)
+        w1.metric("Survival Prob",   f"{W_SURVIVAL:.0%}", "weight")
+        w2.metric("Wait Reduction",  f"{W_WAIT:.0%}",     "weight")
+        w3.metric("Resource Util",   f"{W_UTIL:.0%}",     "weight")
+        w4.metric("Fairness",        f"{W_FAIRNESS:.0%}", "weight")
+        st.caption(
+            "Linear additive utility: U = 0.35·Survival + 0.25·(1 − Wait/MaxWait) + "
+            "0.25·ResourceUtil + 0.15·Fairness   —   all components normalised to [0, 1]."
+        )
+
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        st.markdown("#### 📊 Utility Score Distribution")
+        avg_u = util_df['Computed_Utility'].mean()
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(
+            x=util_df['Computed_Utility'],
+            nbinsx=30,
+            marker=dict(color=COLORS['info'], line=dict(color='white', width=1)),
+            name='Utility',
+        ))
+        fig.add_vline(x=avg_u, line_dash="dash", line_color=COLORS['accent'],
+                      annotation_text=f"Mean = {avg_u:.3f}",
+                      annotation_font_color=COLORS['accent'])
+        fig.update_layout(xaxis_title="Composite Utility Score", yaxis_title="Patients",
+                          showlegend=False)
+        st.plotly_chart(style_plotly(fig, height=380), use_container_width=True)
+
+    with col_r:
+        st.markdown("#### 🔀 Trade-off: Wait Time vs Survival Probability")
+        scatter_df = util_df.copy()
+        scatter_df['Utility_Bin'] = pd.cut(
+            scatter_df['Computed_Utility'], bins=4,
+            labels=['Low', 'Medium', 'High', 'Very High'])
+        fig = px.scatter(
+            scatter_df.sample(min(500, len(scatter_df)), random_state=42),
+            x='Post_Allocation_Wait', y='Survival_Probability',
+            color='Computed_Utility',
+            color_continuous_scale='RdYlGn',
+            size_max=8,
+            opacity=0.65,
+            hover_data=['Patient_ID', 'Computed_Utility'],
+            labels={'Post_Allocation_Wait': 'Post-Allocation Wait (min)',
+                    'Survival_Probability': 'Survival Probability',
+                    'Computed_Utility': 'Utility'},
+        )
+        fig.update_coloraxes(colorbar=dict(title="Utility",
+                                           tickfont=dict(color='#000000')))
+        st.plotly_chart(style_plotly(fig, height=380), use_container_width=True)
+
+    # Utility by severity
+    st.markdown("#### 📈 Utility by Severity & Action")
+    util_sev = util_df.merge(
+        hospital_data[['Patient_ID', 'Severity']], on='Patient_ID', how='left')
+
+    col_l, col_r = st.columns(2)
+    with col_l:
+        sev_util = util_sev.groupby('Severity')['Computed_Utility'].mean().reset_index()
+        fig = go.Figure(go.Bar(
+            x=sev_util['Severity'], y=sev_util['Computed_Utility'],
+            marker=dict(color=[SEVERITY_COLORS.get(s, COLORS['primary'])
+                               for s in sev_util['Severity']],
+                        line=dict(color='white', width=1)),
+            text=sev_util['Computed_Utility'].round(3),
+            textposition='outside',
+            textfont=dict(color='#000000', size=12),
+        ))
+        fig.update_layout(xaxis_title="Severity", yaxis_title="Mean Utility",
+                          yaxis_range=[0, 1], showlegend=False)
+        st.plotly_chart(style_plotly(fig, height=340), use_container_width=True)
+
+    with col_r:
+        act_util = util_df.groupby('Action')['Computed_Utility'].mean().reset_index()
+        fig = go.Figure(go.Bar(
+            x=act_util['Action'], y=act_util['Computed_Utility'],
+            marker=dict(color=[ACTION_COLORS.get(a, COLORS['primary'])
+                               for a in act_util['Action']],
+                        line=dict(color='white', width=1)),
+            text=act_util['Computed_Utility'].round(3),
+            textposition='outside',
+            textfont=dict(color='#000000', size=12),
+        ))
+        fig.update_layout(xaxis_title="Allocation Action", yaxis_title="Mean Utility",
+                          yaxis_range=[0, 1], showlegend=False)
+        st.plotly_chart(style_plotly(fig, height=340), use_container_width=True)
+
+    # Per-patient lookup
+    st.markdown("#### 🔍 Patient Utility Lookup")
+    pid = st.selectbox("Select Patient ID",
+                       util_df.sort_values('Computed_Utility', ascending=False)['Patient_ID'].tolist(),
+                       index=0)
+    row = util_df[util_df['Patient_ID'] == pid].iloc[0]
+    p1, p2, p3, p4, p5 = st.columns(5)
+    p1.metric("Survival Prob",       f"{row['Survival_Probability']:.3f}")
+    p2.metric("Post-Alloc Wait",     f"{row['Post_Allocation_Wait']:.1f} min")
+    p3.metric("Resource Util Input", f"{row['Utility_Score'] / 100:.3f}")
+    p4.metric("Fairness Score",      f"{row['Fairness_Score']:.1f}")
+    p5.metric("Composite Utility",   f"{row['Computed_Utility']:.4f}",
+              delta=f"{'Above' if row['Computed_Utility'] > avg_u else 'Below'} mean")
+
+
+# ============================================================================
+# PAGE 7 — OPTIMIZATION ANALYSIS
 # ============================================================================
 def page_optimization():
     page_header("⚙️ Optimization Analysis",
-                "Comparing RL-only, Optimization-only, and Hybrid RL+Optimization strategies")
+                "PuLP ILP: RL-only · Optimization-only · Hybrid RL+Optimization strategies")
 
-    # ── Local filter ──────────────────────────────────────────────────────────
+    # ── Load real optimization results from notebook Phase 10 ─────────────────
+    opt_strategy_df = load_optional_csv('optimization_strategy_results.csv')
+
+    if opt_strategy_df is not None and not opt_strategy_df.empty:
+        st.success("✅ Loaded `optimization_strategy_results.csv` from notebook Phase 10 (PuLP ILP).")
+
+        # KPIs
+        best_obj = opt_strategy_df.loc[opt_strategy_df['Objective_Value'].idxmax()]
+        best_wait = opt_strategy_df.loc[opt_strategy_df['Avg_Wait_Time'].idxmin()]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("🏆 Best Objective", f"{best_obj['Objective_Value']:.4f}", best_obj['Strategy'])
+        c2.metric("⏱️ Best Avg Wait", f"{best_wait['Avg_Wait_Time']:.1f} min", best_wait['Strategy'])
+        c3.metric("🚨 Critical Selected",
+                  int(opt_strategy_df.loc[opt_strategy_df['Objective_Value'].idxmax(), 'Critical_Selected']))
+        c4.metric("🎯 Strategies Compared", str(len(opt_strategy_df)))
+
+        st.markdown("#### 📊 PuLP Strategy Comparison")
+        full_palette = [COLORS['secondary'], COLORS['accent'], COLORS['success']]
+        metric_cols = ['Selected_Patients', 'Avg_Utility', 'Critical_Selected', 'Ventilator_Used']
+        metric_labels = ['Patients Selected', 'Avg Utility', 'Critical Patients', 'Ventilators Used']
+
+        fig = make_subplots(rows=1, cols=4,
+                            subplot_titles=metric_labels)
+        for i, (metric, label) in enumerate(zip(metric_cols, metric_labels), start=1):
+            vals = opt_strategy_df[metric].tolist()
+            colors_list = full_palette[:len(vals)]
+            fig.add_trace(go.Bar(
+                x=opt_strategy_df['Strategy'].tolist(),
+                y=vals,
+                marker=dict(color=colors_list, line=dict(color='white', width=1)),
+                text=[f"{v:.3f}" if isinstance(v, float) else str(v) for v in vals],
+                textposition='outside',
+                textfont=dict(color='#000000', size=11),
+                showlegend=False,
+            ), row=1, col=i)
+        fig.update_layout(height=400)
+        fig.update_xaxes(tickangle=-20)
+        st.plotly_chart(style_plotly(fig), use_container_width=True)
+
+        # Full table
+        st.markdown("#### 📋 Full PuLP Results Table")
+        st.dataframe(opt_strategy_df, use_container_width=True, hide_index=True,
+                     column_config={
+                         'Objective_Value': st.column_config.ProgressColumn(
+                             'Objective Value', min_value=0, max_value=1, format="%.4f"),
+                         'Avg_Utility': st.column_config.ProgressColumn(
+                             'Avg Utility', min_value=0, max_value=1, format="%.4f"),
+                     })
+
+        with st.container(border=True):
+            st.markdown("##### 🎯 ILP Model Notes")
+            st.markdown(
+                "- **RL Only:** maximises RL policy value (Q-value spread) subject to capacity constraints.\n"
+                "- **Optimization Only:** maximises composite utility with critical-patient and ventilator bonuses.\n"
+                "- **Hybrid RL+Opt:** 70% utility + 30% RL policy value — best total reward per notebook.\n"
+                "- All models use capacity constraints: Beds ≤ 30, Doctors ≤ 15, Nurses ≤ 20, Ventilators ≤ 10."
+            )
+
+        st.markdown("---")
+        st.markdown("#### 📊 Full Strategy Comparison from evaluation_metrics.csv")
+
+    # ── evaluation_metrics comparison (always shown) ──────────────────────────
     with st.expander("🔧 Local filters", expanded=False):
         all_strategies = evaluation_metrics['Strategy'].tolist()
         strat_filter = st.multiselect(
             "Strategies to Compare",
             options=all_strategies,
             default=all_strategies,
-            help="Choose which strategies to include in the comparison.",
         )
     if not strat_filter:
         strat_filter = all_strategies
@@ -1101,92 +1645,74 @@ def page_optimization():
         st.warning("Select at least one strategy.")
         return
 
-    # KPIs - best strategy summary (from filtered set)
     best_reward = eval_filtered.loc[eval_filtered['Total_Reward'].idxmax()]
-    best_wait   = eval_filtered.loc[eval_filtered['Average_Wait_Time'].idxmin()]
+    best_wait_em = eval_filtered.loc[eval_filtered['Average_Wait_Time'].idxmin()]
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🏆 Best Total Reward",
-              f"{best_reward['Total_Reward']:,.0f}",
-              best_reward['Strategy'])
-    c2.metric("⏱️ Best Wait Time",
-              f"{best_wait['Average_Wait_Time']:.1f} min",
-              best_wait['Strategy'])
+    c1.metric("🏆 Best Total Reward",     f"{best_reward['Total_Reward']:,.0f}",    best_reward['Strategy'])
+    c2.metric("⏱️ Best Wait Time",        f"{best_wait_em['Average_Wait_Time']:.1f} min", best_wait_em['Strategy'])
     c3.metric("📊 Allocation Rate",
-              f"{eval_filtered['Allocated_Patients'].iloc[0] / 10:.0f}%")
+              f"{eval_filtered['Allocated_Patients'].iloc[0] / max(len(hospital_data), 1) * 100:.0f}%")
     c4.metric("🎯 Strategies Compared", str(len(eval_filtered)))
 
-    # Bar chart of all metrics
-    st.markdown("#### 📊 Strategy Comparison — All Metrics")
-
-    metric_cols = ['Average_Wait_Time', 'Critical_Response_Time', 'Total_Reward']
-    strategies  = eval_filtered['Strategy'].tolist()
-
+    metric_cols_em = ['Average_Wait_Time', 'Critical_Response_Time', 'Total_Reward']
+    strategies = eval_filtered['Strategy'].tolist()
     fig = make_subplots(rows=1, cols=3,
-                        subplot_titles=("Avg Wait Time (min)",
-                                        "Critical Response (min)",
-                                        "Total Reward"))
-    full_palette = [COLORS['secondary'], COLORS['accent'], COLORS['success']]
-    strategy_colors = full_palette[:len(strategies)]
-
-    for i, metric in enumerate(metric_cols, start=1):
+                        subplot_titles=("Avg Wait Time (min)", "Critical Response (min)", "Total Reward"))
+    strategy_colors = [COLORS['secondary'], COLORS['accent'], COLORS['success']][:len(strategies)]
+    for i, metric in enumerate(metric_cols_em, start=1):
         values = eval_filtered[metric].tolist()
         fig.add_trace(go.Bar(
             x=strategies, y=values,
-            marker=dict(color=strategy_colors,
-                        line=dict(color='white', width=1)),
+            marker=dict(color=strategy_colors, line=dict(color='white', width=1)),
             text=[f"{v:,.1f}" if v < 1000 else f"{v:,.0f}" for v in values],
             textposition='outside',
             textfont=dict(color=COLORS['text_dark'], size=12),
             showlegend=False,
         ), row=1, col=i)
-
     fig.update_layout(height=420)
     fig.update_xaxes(tickangle=-15)
     st.plotly_chart(style_plotly(fig), use_container_width=True)
 
-    # Radar chart + utility
+    # Radar + table
     col_l, col_r = st.columns([2, 3])
-
     with col_l:
         st.markdown("#### 🕸️ Multi-Metric Radar")
-        # Normalize for radar
         radar_metrics = ['Average_Wait_Time', 'Resource_Utilization',
                          'Critical_Response_Time', 'Fairness_Index', 'Total_Reward']
         norm_df = eval_filtered.copy()
         for m in radar_metrics:
+            rng = max(norm_df[m].max() - norm_df[m].min(), 1e-9)
             if m in ['Average_Wait_Time', 'Critical_Response_Time']:
-                # Lower is better → invert
-                norm_df[m] = 1 - (norm_df[m] - norm_df[m].min()) / max(norm_df[m].max() - norm_df[m].min(), 1e-9)
+                norm_df[m] = 1 - (norm_df[m] - norm_df[m].min()) / rng
             else:
-                norm_df[m] = (norm_df[m] - norm_df[m].min()) / max(norm_df[m].max() - norm_df[m].min(), 1e-9)
+                norm_df[m] = (norm_df[m] - norm_df[m].min()) / rng
 
-        fig = go.Figure()
-        for i, strat in enumerate(strategies):
-            row = norm_df[norm_df['Strategy'] == strat].iloc[0]
-            fig.add_trace(go.Scatterpolar(
-                r=[row[m] for m in radar_metrics] + [row[radar_metrics[0]]],
-                theta=[m.replace('_', '<br>') for m in radar_metrics] + [radar_metrics[0].replace('_','<br>')],
-                fill='toself',
-                name=strat,
-                line=dict(color=strategy_colors[i], width=2),
-                fillcolor=strategy_colors[i],
-                opacity=0.4,
-            ))
-        fig.update_layout(
-            polar=dict(
-                bgcolor='white',
-                radialaxis=dict(visible=True, range=[0, 1],
-                                gridcolor=COLORS['border']),
-                angularaxis=dict(gridcolor=COLORS['border'],
-                                  tickfont=dict(color=COLORS['text_dark'], size=10)),
-            ),
-            height=480,
-            showlegend=True,
-            legend=dict(x=0.7, y=1.1, orientation='h'),
-        )
-        fig.update_layout(plot_bgcolor='white', paper_bgcolor='white',
-                          font=dict(color=COLORS['text_dark']))
-        st.plotly_chart(fig, use_container_width=True)
+        if len(strategies) >= 2:
+            fig = go.Figure()
+            for i, strat in enumerate(strategies):
+                row = norm_df[norm_df['Strategy'] == strat].iloc[0]
+                fig.add_trace(go.Scatterpolar(
+                    r=[row[m] for m in radar_metrics] + [row[radar_metrics[0]]],
+                    theta=[m.replace('_', '<br>') for m in radar_metrics] + [radar_metrics[0].replace('_', '<br>')],
+                    fill='toself', name=strat,
+                    line=dict(color=strategy_colors[i], width=2),
+                    fillcolor=strategy_colors[i], opacity=0.4,
+                ))
+            fig.update_layout(
+                polar=dict(
+                    bgcolor='white',
+                    radialaxis=dict(visible=True, range=[0, 1], gridcolor=COLORS['border']),
+                    angularaxis=dict(gridcolor=COLORS['border'],
+                                     tickfont=dict(color=COLORS['text_dark'], size=10)),
+                ),
+                height=480, showlegend=True,
+                legend=dict(x=0.7, y=1.1, orientation='h'),
+            )
+            fig.update_layout(plot_bgcolor='white', paper_bgcolor='white',
+                              font=dict(color=COLORS['text_dark']))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Select at least 2 strategies to display the radar chart.")
 
     with col_r:
         st.markdown("#### 📋 Detailed Metrics Table")
@@ -1196,14 +1722,12 @@ def page_optimization():
         st.dataframe(display_df, use_container_width=True, hide_index=True,
                      column_config={
                         'Total_Reward': st.column_config.ProgressColumn(
-                            'Total Reward', min_value=15000, max_value=22000,
-                            format="%.0f"),
+                            'Total Reward', min_value=15000, max_value=22000, format="%.0f"),
                         'Fairness_Index': st.column_config.ProgressColumn(
                             'Fairness', min_value=0, max_value=1, format="%.2f"),
                         'Resource_Utilization': st.column_config.ProgressColumn(
                             'Utilization', min_value=0, max_value=1, format="%.2f"),
                      })
-
         with st.container(border=True):
             st.markdown("##### 🎯 Recommendation")
             st.markdown(
@@ -1212,28 +1736,25 @@ def page_optimization():
                 "wait times. Recommend deployment as default operational strategy."
             )
 
-    # Allocation breakdown from allocation_results
+    # Allocation breakdown
     st.markdown("#### 🔬 Allocation Decisions Breakdown")
-    action_counts = allocation_results['Action'].value_counts().reset_index()
-    action_counts.columns = ['Action', 'Count']
+    action_counts_df = allocation_results['Action'].value_counts().reset_index()
+    action_counts_df.columns = ['Action', 'Count']
     col_l, col_r = st.columns([2, 3])
     with col_l:
         fig = go.Figure(data=[go.Pie(
-            labels=action_counts['Action'], values=action_counts['Count'],
+            labels=action_counts_df['Action'], values=action_counts_df['Count'],
             marker=dict(colors=[ACTION_COLORS.get(a, COLORS['primary'])
-                                for a in action_counts['Action']],
+                                for a in action_counts_df['Action']],
                         line=dict(color='white', width=2)),
             hole=0.5, textinfo='label+percent',
-            textfont=dict(color='white', size=12)
+            textfont=dict(color='#000000', size=12),
         )])
         fig.update_layout(height=320, showlegend=False)
         st.plotly_chart(style_plotly(fig), use_container_width=True)
     with col_r:
-        # Plotly's `size` parameter requires non-negative values, but Reward can
-        # be negative (e.g. resource waste = -50). Use absolute Reward for marker
-        # size and keep the signed Reward in the hover tooltip.
         scatter_df = allocation_results.head(200).copy()
-        scatter_df['Size'] = scatter_df['Reward'].abs() + 1   # +1 so zero-reward dots still visible
+        scatter_df['Size'] = scatter_df['Reward'].abs() + 1
         fig = px.scatter(
             scatter_df,
             x='Priority_Rank', y='Utility_Score', color='Action',
@@ -1246,7 +1767,7 @@ def page_optimization():
 
 
 # ============================================================================
-# PAGE 7 — DECISION TRADE-OFF STUDIO
+# PAGE 8 — DECISION TRADE-OFF STUDIO
 # ============================================================================
 def page_tradeoff():
     page_header("🎚️ Decision Trade-Off Studio",
@@ -1496,9 +2017,10 @@ PAGES = {
     "🔥  3. Fuzzy Triage":         page_fuzzy,
     "🎯  4. MCDM Analysis":        page_mcdm,
     "🤖  5. RL Analytics":         page_rl,
-    "⚙️  6. Optimization":        page_optimization,
-    "🎚️  7. Trade-Off Studio":    page_tradeoff,
-    "📈  8. Executive Dashboard": page_executive,
+    "💡  6. Utility Theory":       page_utility,
+    "⚙️  7. Optimization":        page_optimization,
+    "🎚️  8. Trade-Off Studio":    page_tradeoff,
+    "📈  9. Executive Dashboard": page_executive,
 }
 
 PAGES[page]()
