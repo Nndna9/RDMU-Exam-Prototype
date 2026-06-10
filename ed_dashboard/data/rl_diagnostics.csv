@@ -1,0 +1,7 @@
+Metric,Value
+Episodes,1000.0
+Learned_States,2255.0
+Total_State_Visits,120000.0
+Exploration_Actions,24073.0
+Exploitation_Actions,95927.0
+Final_50_Episode_Avg_Reward,5270.24
